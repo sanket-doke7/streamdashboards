@@ -19,6 +19,7 @@ CSV_TZ = os.getenv("CSV_TZ", "Asia/Kolkata")
 IN_DIR = os.path.join(os.getcwd(), "input_tickdata")
 OUT_DIR = os.path.join(os.getcwd(), "processed")
 os.makedirs(OUT_DIR, exist_ok=True)
+EXPIRY_INTRA_DAY_OFFSET = pd.Timedelta(hours=15, minutes=30)
 
 def parse_ts(val: Union[str, int, float, pd.Timestamp]) -> pd.Timestamp:
     """Parse varied timestamp formats (ns integers, ISO strings) into tz-aware values."""
@@ -66,6 +67,35 @@ def parse_ts(val: Union[str, int, float, pd.Timestamp]) -> pd.Timestamp:
         return pd.NaT
 
     return ts.tz_convert(target_tz)
+
+def standardize_expiry(expiry: Union[pd.Series, pd.Timestamp, None]) -> Union[pd.Series, pd.Timestamp, None]:
+    """Force option expiry timestamps to the market close (15:30 local time)."""
+    if expiry is None:
+        return pd.NaT
+
+    target_tz = CSV_TZ or "Asia/Kolkata"
+    offset = EXPIRY_INTRA_DAY_OFFSET
+
+    if isinstance(expiry, pd.Series):
+        ser = expiry.copy()
+        if ser.dt.tz is None:
+            ser = ser.dt.tz_localize(target_tz)
+        else:
+            ser = ser.dt.tz_convert(target_tz)
+        ser = ser.dt.normalize() + offset
+        return ser.dt.tz_convert(target_tz)
+
+    if isinstance(expiry, pd.Timestamp):
+        ts = expiry
+        if pd.isna(ts):
+            return pd.NaT
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(target_tz)
+        else:
+            ts = ts.tz_convert(target_tz)
+        return ts.normalize() + offset
+
+    return expiry
 
 def time_to_expiry_yrs(now_ts: pd.Timestamp, expiry: pd.Timestamp) -> float:
     # year fraction ACT/365
@@ -185,12 +215,9 @@ def normalize_option_frame(df: pd.DataFrame, expiry_hint: Optional[pd.Timestamp]
 
     if exp_col:
         expiry = pd.to_datetime(df[exp_col].astype(str), errors="coerce")
-        # Localize if naive
-        if expiry.dt.tz is None:
-            expiry = expiry.dt.tz_localize("Asia/Kolkata")
-        out["expiry"] = expiry
+        out["expiry"] = standardize_expiry(expiry)
     else:
-        out["expiry"] = expiry_hint  # can be None; later we’ll drop rows without expiry
+        out["expiry"] = standardize_expiry(expiry_hint)  # can be None; later we’ll drop rows without expiry
 
     return out.dropna(subset=["ts","option_type","strike","mid"])
 
@@ -248,8 +275,8 @@ def main():
             if c in raw.columns:
                 expiry_series = pd.to_datetime(raw[c], errors="coerce")
                 expiry_hint = expiry_series.dropna().iloc[0] if not expiry_series.dropna().empty else None
-                if expiry_hint is not None and expiry_hint.tz is None:
-                    expiry_hint = expiry_hint.tz_localize("Asia/Kolkata")
+                if expiry_hint is not None:
+                    expiry_hint = standardize_expiry(expiry_hint)
                 break
 
         try:
